@@ -1,0 +1,26 @@
+# Entornos virtuales
+.venv/
+env/
+venv/
+
+# Archivos temporales / caché
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Archivos de lock temporales
+uv.lock
+
+# Archivos de entorno (no subir credenciales)
+.env
+
+# Salidas generadas
+inbox/
+out/
+logs/
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
