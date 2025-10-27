@@ -14,14 +14,14 @@ from .base import BaseAdapter
 
 PROVEEDOR = "VARONA 2008, S.L."
 
-# Mapeo para identificar almacenes a partir del texto del PDF
+# Mapeo de almacén textual -> nombre esperado en Odoo
 ALMACEN_MAP = {
     "CENTRAL": "Central",
     "MIRALBAIDA": "Miralbaida",
     "AMARGACENA": "Amargacena",
 }
 
-# Regex numérico: acepta signo negativo, formato “-12,34”
+# Números con coma (precio/cantidad), p. ej. "12,34", "-1,00"
 NUM_RE = re.compile(r"-?\d+,\d{2}")
 
 
@@ -54,22 +54,20 @@ def ref_albaran(txt: str) -> str:
 
 
 def detectar_almacen(txt: str) -> str:
-    """
-    Detecta el almacén de entrega buscando coincidencias con ALMACEN_MAP.
-    Prioriza la última coincidencia encontrada. Incluye mapeo de dirección específica.
-    """
-    # Dirección específica → Central
+    """Detecta el almacén de entrega buscando coincidencias."""
+    # Detección directa: dirección Central
     if "Ctra. Aeropuerto, Km. 4" in txt:
         return "Central"
-
+    # Por líneas que empiezan por el nombre del almacén
     destino = ""
     for linea in txt.splitlines():
         up = linea.strip().upper()
         for k, v in ALMACEN_MAP.items():
             if up.startswith(k):
-                destino = v  # Guarda última coincidencia
+                destino = v
     if destino:
         return destino
+    # Por presencia en cualquier lugar del texto
     up = txt.upper()
     for k, v in ALMACEN_MAP.items():
         if k in up:
@@ -79,8 +77,7 @@ def detectar_almacen(txt: str) -> str:
 
 def _join_hyphen_number_if_adjacent(row_words, number_token):
     """
-    Si hay un '-' suelto a la izquierda del número (pegado visualmente),
-    anteponer el signo a la cantidad.
+    Si detecta un '-' inmediatamente antes de un número (pegado por layout), prepende el signo.
     """
     x = number_token["x0"]
     candidates = [w for w in row_words if w["text"] == "-" and 0 < (x - w["x0"]) <= 10]
@@ -90,15 +87,12 @@ def _join_hyphen_number_if_adjacent(row_words, number_token):
 
 
 def parsear(words) -> List[Dict[str, Any]]:
-    """
-    Procesa las palabras extraídas del PDF para obtener líneas:
-    devuelve dicts con: cod, desc, qty, price, dto
-    """
+    """Procesa las palabras extraídas del PDF para obtener líneas."""
     res = []
     for fila in agrupar_filas(words):
         fila = sorted(fila, key=lambda w: w["x0"])
 
-        # Código de artículo (x entre 30–80, alfanumérico ≥5)
+        # Heurística para localizar el código: bloque de 5+ caracteres A-Z0-9 en x0 [30..80]
         code_i = next(
             (
                 i
@@ -110,7 +104,7 @@ def parsear(words) -> List[Dict[str, Any]]:
         if code_i is None:
             continue
 
-        # Números “[-]nn,nn” con su X
+        # Detecta números (candidatos a qty / price / dto) con sus x0
         nums = [
             {"val": m.group(0), "x": w["x0"], "tok": w}
             for w in fila
@@ -119,7 +113,7 @@ def parsear(words) -> List[Dict[str, Any]]:
         if not nums:
             continue
 
-        # Precio unitario (columna aprox. 300–450 pt)
+        # Precio: suele ir a la derecha; si hay varios, el más a la derecha en [300..450], si no, el más a la derecha de todos
         cand_price = [n for n in nums if 300 <= n["x"] <= 450]
         price_tok = (
             max(cand_price, key=lambda n: n["x"])
@@ -128,22 +122,23 @@ def parsear(words) -> List[Dict[str, Any]]:
         )
         price = price_tok["val"].replace(",", ".")
 
-        # Región entre código y precio
+        # Rango horizontal entre código y precio, para buscar qty y descripción
         left_x = fila[code_i]["x0"]
         right_x = price_tok["x"]
 
-        # Cantidad: buscar 100–300; si no, antes del precio
+        # Cantidad: número intermedio entre código y precio; si no claro, primer número entre left_x y right_x
         qty_candidate = next((n for n in nums if 100 <= n["x"] <= 300), None)
         if qty_candidate is None:
             qty_candidate = next((n for n in nums if left_x < n["x"] < right_x), None)
 
-        # Cantidad pegada al final de la descripción: “...TEXTO-1,00”
+        # A veces el '-' se pega a la última palabra de la descripción: "XXXX -1,00"
         trailing_neg_match = None
         tokens_between = [w for w in fila[code_i + 1 :] if w["x0"] < right_x]
         for w in tokens_between:
             m = re.match(r"^(.*?)-(\d+,\d{2})$", w["text"])
             if m:
                 trailing_neg_match = m
+
         if qty_candidate:
             qty_txt = _join_hyphen_number_if_adjacent(fila, qty_candidate["tok"])
         elif trailing_neg_match:
@@ -153,7 +148,7 @@ def parsear(words) -> List[Dict[str, Any]]:
 
         qty = qty_txt.replace(",", ".")
 
-        # Descuentos en 450–520 pt (≤100%). Si hay dos → descuento efectivo.
+        # Descuentos: suelen ir más a la derecha (x ~ 450-520). Se combinan si hay dos (d1+d2-d1*d2/100).
         dto_vals: List[float] = []
         for n in nums:
             if 450 <= n["x"] <= 520:
@@ -172,25 +167,24 @@ def parsear(words) -> List[Dict[str, Any]]:
             dto_eff = 100 * (1 - (1 - d1 / 100) * (1 - d2 / 100))
             dto = f"{dto_eff:.2f}"
 
-        # Descripción entre código y precio (limpia números y “-d,dd” final)
+        # Descripción = tokens entre código y precio, excluyendo tokens numéricos y el patrón "-\d+,\d{2}" final
         desc_parts: List[str] = []
         for w in tokens_between:
             t = w["text"]
             if t == "-" or NUM_RE.fullmatch(t):
                 continue
-            t = re.sub(r"-\d+,\d{2}$", "", t)  # recorta sufijo '-d,dd' si existe
+            t = re.sub(r"-\d+,\d{2}$", "", t)
             if t:
                 desc_parts.append(t)
         desc = " ".join(desc_parts).strip()
 
-        # Código sin los 3 primeros chars (p.ej., “185-4200348-5KG” → “4200348-5KG”)
+        # Código final: Varona antepone 3 chars (p.ej. "VA0"); se recortan si procede
         raw = fila[code_i]["text"]
         codigo = raw[3:] if len(raw) > 3 else raw
 
         res.append(
             {"cod": codigo, "desc": desc, "qty": qty, "price": price, "dto": dto}
         )
-
     return res
 
 
@@ -212,22 +206,19 @@ class Varona(BaseAdapter):
 
     @staticmethod
     def detect(txt: str, filename: str) -> bool:
-        # Señales: texto del proveedor o patrón VA0xxxx en nombre
         return "VARONA 2008" in txt or bool(re.search(r"VA0\d+", filename.upper()))
 
     @staticmethod
     def parse(pdf_path: str) -> pd.DataFrame:
-        # 1) Extraer palabras y texto lineal
         pdfp = pathlib.Path(pdf_path)
         words = leer_pdf(pdfp)
         texto = "\n".join(w["text"] for w in words)
 
-        # 2) Parsear líneas
         filas = parsear(words)
         if not filas:
             raise ValueError("⚠️  No se encontraron líneas de artículo.")
 
-        # 3) Construir DF de líneas (sin cabeceras globales aún)
+        # Construye DataFrame de líneas
         df_lines = pd.DataFrame(
             {
                 "Líneas del pedido/Producto": [
@@ -240,10 +231,10 @@ class Varona(BaseAdapter):
             }
         )
 
-        # 4) Línea opcional: Aportación al servicio de reparto (1 uds, 2.67€)
-        t = texto.casefold()
-        if ("aportación al servicio de reparto" in t) or (
-            "aportacion al servicio de reparto" in t
+        # Línea extra de aportación si aparece el concepto en el PDF
+        texto_lower = texto.casefold()
+        if ("aportación al servicio de reparto" in texto_lower) or (
+            "aportacion al servicio de reparto" in texto_lower
         ):
             df_lines = pd.concat(
                 [
@@ -263,21 +254,19 @@ class Varona(BaseAdapter):
                 ignore_index=True,
             )
 
-        # 5) Cabecera: referencia y almacén
+        # Completa cabeceras y valores de proveedor/ref/entregar_a
         partner_ref = ref_albaran(texto)
         almacen = detectar_almacen(texto)
-
-        # 6) Añadir columnas globales y ordenar según HEAD
         df = df_lines.copy()
         df["Proveedor"] = PROVEEDOR
         df["Referencia de proveedor"] = partner_ref
         df["Entregar a"] = almacen
 
-        # Asegurar todas las columnas HEAD y su orden
+        # Orden de columnas y relleno de faltantes
         for col in Varona.HEAD:
             if col not in df.columns:
                 df[col] = ""
 
         df = df[Varona.HEAD]
-        df.attrs["HEAD"] = Varona.HEAD  # para que el writer respete el orden
+        df.attrs["HEAD"] = Varona.HEAD
         return df

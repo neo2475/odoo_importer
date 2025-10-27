@@ -1,5 +1,5 @@
+# core/normalize.py
 from __future__ import annotations
-
 from typing import Optional
 
 
@@ -24,3 +24,4 @@ def map_warehouse(address: Optional[str], mapping: dict[str, str], default: str)
         if k.lower() in address.lower():
             return v
     return default
+

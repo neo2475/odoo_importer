@@ -4,17 +4,17 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
-import unicodedata
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Adapters: asumo paquete 'adapters' con registry
-from adapters import detect_provider, get_adapter, registry  # type: ignore
 from core.csv_writer import write_csv
 from core.gmail_downloader import fetch_from_labels
 from core.logger import get_logger, setup_logging
 from core.pdf import read_pdf_text
+
+# Adapters: asumo paquete 'adapters' con registry
+from adapters import detect_provider, get_adapter, registry  # type: ignore
 
 
 def _call_odoo_importer(csv_path: Path, log) -> None:
@@ -22,23 +22,21 @@ def _call_odoo_importer(csv_path: Path, log) -> None:
     A) Modulo externo "importar_csv_odoo" si existe.
     B) Fallback: nuestro importador "core.odoo_importer.import_csv".
     """
+    # Opción A: importador legacy si el usuario lo tiene en el entorno PYTHONPATH
     try:
         import importar_csv_odoo  # type: ignore
-
         importar_csv_odoo.main(str(csv_path))
         log.info(f"[IMPORT] Odoo OK (importar_csv_odoo.main): {csv_path.name}")
         return
     except ModuleNotFoundError:
-        log.debug(
-            "[IMPORT] importar_csv_odoo no encontrado, probando core.odoo_importer..."
-        )
+        log.debug("[IMPORT] importar_csv_odoo no encontrado, probando core.odoo_importer...")
     except Exception as e:
         log.exception(f"[IMPORT] Error con importar_csv_odoo.main: {e}")
         raise
 
     try:
+        # Opción B: importador modular
         from core.odoo_importer import import_csv
-
         import_csv(str(csv_path))
         log.info(f"[IMPORT] Odoo OK (core.odoo_importer.import_csv): {csv_path.name}")
     except Exception as e:
@@ -48,11 +46,13 @@ def _call_odoo_importer(csv_path: Path, log) -> None:
 
 def _detect_provider_safe(text: str, filename: str | None, log):
     """Compat con detect_provider(text, filename) y detect_provider(text)."""
+    # 1) Preferimos firma nueva: (text, filename)
     try:
         prov = detect_provider(text, filename)  # type: ignore[arg-type]
         if prov:
             return prov
     except TypeError:
+        # Firma antigua
         try:
             prov = detect_provider(text)  # type: ignore[call-arg]
             if prov:
@@ -62,104 +62,63 @@ def _detect_provider_safe(text: str, filename: str | None, log):
     except Exception as e:
         log.debug(f"[ADAPTERS] detect_provider(text, filename) falló: {e}")
 
+    # 2) Heurística mínima por nombre/contenido
     fname = (filename or "").lower()
     low = text.lower()
     if "michelin" in low or "michelin" in fname:
         return "michelin"
-    if (
-        "grupo peña" in low
-        or "gp automoción" in low
-        or "gp automocion" in low
-        or "gpa" in fname
-    ):
-        return "grupo_pena"
+    if "grupo peña" in low or "gp automoción" in low or "gp automocion" in low or "gpa" in fname:
+        return "grupo_pena"  # adapta al key de tu registry
     if "varona" in low or "varona" in fname:
         return "varona"
     return ""
 
 
-def _iter_pdfs(directory: Path) -> list[Path]:
-    """
-    Devuelve PDFs en 'directory' aceptando .pdf/.PDF y nombres Unicode.
-    """
-    if not directory.exists() or not directory.is_dir():
-        return []
-    out: list[Path] = []
-    for p in sorted(directory.iterdir()):
-        if not p.is_file():
-            continue
-        # normaliza Unicode para comparaciones
-        name_norm = unicodedata.normalize("NFC", p.name)
-        if name_norm.lower().endswith(".pdf"):
-            out.append(p)
-    return out
-
-
-def _resolve_to_process(input_arg: str | None, inbox_dir: Path) -> list[Path]:
-    """
-    Decide qué PDFs procesar según input/inbox.
-    - Si input es fichero PDF -> ese fichero.
-    - Si input es carpeta -> todos los PDFs (case-insensitive).
-    - Si no hay input -> PDFs en inbox.
-    """
-    if input_arg:
-        p = Path(input_arg)
-        if p.is_file() and unicodedata.normalize("NFC", p.name).lower().endswith(
-            ".pdf"
-        ):
-            return [p]
-        if p.is_dir():
-            return _iter_pdfs(p)
-        print(f"[ERROR] input inválido: {p}")
-        return []
-    # sin input explícito: usar inbox
-    inbox_dir.mkdir(parents=True, exist_ok=True)
-    return _iter_pdfs(inbox_dir)
-
-
 def main():
     load_dotenv()
-    setup_logging()
+    setup_logging()  # activar sinks (consola + logs/app.log)
     log = get_logger()
 
-    # Registrar adapters
+    # Registrar adapters (asegúrate de tenerlos en tu proyecto)
     import adapters.gpautomocion  # noqa: F401
-    import adapters.michelin  # noqa: F401
-    import adapters.varona  # noqa: F401
+    import adapters.michelin      # noqa: F401
+    import adapters.varona        # noqa: F401
 
     log.debug(f"[ADAPTERS] Registrados: {list(registry.keys())}")
 
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "input", nargs="?", help="Ruta a PDF o carpeta (si no se usa --fetch-mail)"
-    )
+    ap.add_argument("input", nargs="?", help="Ruta a PDF o carpeta (si no se usa --fetch-mail)")
     ap.add_argument("--provider", help="Forzar proveedor (opcional)")
-    ap.add_argument(
-        "--import", dest="do_import", action="store_true", help="Importar a Odoo"
-    )
+    ap.add_argument("--import", dest="do_import", action="store_true", help="Importar a Odoo")
     ap.add_argument("--out", default="out", help="Carpeta de salida CSV")
-    ap.add_argument(
-        "--fetch-mail",
-        action="store_true",
-        help="Descargar PDFs de Gmail a INPUT_DIR/--inbox",
-    )
-    ap.add_argument(
-        "--inbox",
-        default=os.getenv("INPUT_DIR", "inbox"),
-        help="Carpeta destino de PDFs (inbox)",
-    )
+    ap.add_argument("--fetch-mail", action="store_true", help="Descargar PDFs de Gmail a INPUT_DIR/--inbox")
+    ap.add_argument("--inbox", default=os.getenv("INPUT_DIR", "inbox"), help="Carpeta destino de PDFs (inbox)")
     args = ap.parse_args()
-
-    inbox = Path(args.inbox)
 
     # 1) Descarga previa desde Gmail (opcional)
     if args.fetch_mail:
+        inbox = Path(args.inbox)
         inbox.mkdir(parents=True, exist_ok=True)
         saved = fetch_from_labels(str(inbox))
         print(f"[GMAIL] Guardados {len(saved)} PDFs en {inbox.resolve()}")
 
-    # 2) Detectar PDFs a procesar (case-insensitive + Unicode)
-    to_process = _resolve_to_process(args.input, inbox)
+    # 2) Detectar PDFs a procesar
+    to_process: list[Path] = []
+    if args.input:
+        p = Path(args.input)
+        if p.is_file() and p.suffix.lower() == ".pdf":
+            to_process = [p]
+        elif p.is_dir():
+            to_process = sorted(p.glob("*.pdf"))
+        else:
+            print(f"[ERROR] input inválido: {p}")
+            return
+    else:
+        # sin input explícito: usar inbox por defecto
+        inbox = Path(args.inbox)
+        inbox.mkdir(parents=True, exist_ok=True)
+        to_process = sorted(inbox.glob("*.pdf"))
+
     if not to_process:
         print("[INFO] No hay PDFs que procesar.")
         return
@@ -171,19 +130,13 @@ def main():
     for pdf in to_process:
         try:
             # Detectar proveedor
-            try:
-                text = read_pdf_text(pdf)
-            except Exception as e:
-                msg = f"[ERROR] No se pudo leer el PDF {pdf.name}: {e}"
-                print(msg)
-                log.exception(msg)
-                continue
-
+            text = read_pdf_text(pdf)
             provider_name = args.provider or _detect_provider_safe(text, pdf.name, log)
             if not provider_name:
                 msg = f"[SKIPPED] Proveedor no reconocido para {pdf.name}"
                 print(msg)
                 log.warning(msg)
+                # Continúa con el siguiente PDF en vez de abortar todo
                 continue
 
             Adapter = get_adapter(provider_name)
@@ -197,8 +150,8 @@ def main():
             if args.do_import:
                 _call_odoo_importer(csv_path, log)
 
-            # === Mover PDF procesado a carpeta processed/ junto a su carpeta origen ===
-            processed_dir = pdf.parent / "processed"
+            # === Mover PDF procesado a carpeta processed/ ===
+            processed_dir = Path("processed")
             processed_dir.mkdir(parents=True, exist_ok=True)
             dest = processed_dir / pdf.name
             try:
@@ -210,6 +163,7 @@ def main():
                 log.error(f"[PIPELINE] Error moviendo {pdf}: {e}")
 
         except Exception as e:
+            # Manejo por fichero: loguea y continúa
             err = f"[ERROR] Procesando {pdf.name}: {e}"
             print(err)
             log.exception(err)
@@ -218,3 +172,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

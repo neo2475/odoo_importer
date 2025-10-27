@@ -10,16 +10,13 @@ def _page_text(page) -> str:
     txt = page.extract_text() or ""
     if txt.strip():
         return txt
-    # Fallback: si extract_text() devuelve None, ensamblar con extract_words()
     try:
         words = page.extract_words() or []
-        # Agrupado simple por líneas usando la coordenada 'top'
-        words = sorted(words, key=lambda w: (round(w["top"]), w["x0"]))
         lines = []
-        cur_top = None
         cur = []
+        cur_top = None
         for w in words:
-            top = round(w["top"])
+            top = round(w.get("top", 0), 0)
             if cur_top is None or top == cur_top:
                 cur.append(w["text"])
                 cur_top = top if cur_top is None else cur_top
@@ -35,7 +32,6 @@ def _page_text(page) -> str:
 
 
 def extract_text(pdf_path: str | Path) -> str:
-    """Texto plano de TODO el PDF (todas las páginas)."""
     pdf_path = Path(pdf_path)
     parts = []
     with pdfplumber.open(pdf_path) as pdf:
@@ -45,5 +41,5 @@ def extract_text(pdf_path: str | Path) -> str:
 
 
 def read_pdf_text(pdf_path: str | Path) -> str:
-    """Alias usado por cli.py para detección de proveedor."""
     return extract_text(pdf_path)
+

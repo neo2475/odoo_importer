@@ -3,36 +3,45 @@ from __future__ import annotations
 
 import email
 import imaplib
+import mimetypes
 import os
 import re
-from typing import Iterable, List, Tuple
+import time
+from email.header import decode_header
+from typing import Iterable, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
 from core.logger import get_logger
 
-# Cargar .env con override ANTES de leer variables
+# =========================
+# Carga de entorno y logger
+# =========================
 load_dotenv(override=True)
 log = get_logger()
 
-# --- Config básica ---
-GMAIL_DEBUG = os.getenv("GMAIL_DEBUG", "false").lower() in {"1", "true", "yes"}
-IMAP_HOST = os.getenv("GMAIL_IMAP", "imap.gmail.com")
+IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
 GMAIL_USER = os.getenv("GMAIL_USER", "")
 GMAIL_PASSWORD = os.getenv("GMAIL_PASSWORD", "")
-# Solo correos no leídos
-GMAIL_UNSEEN_ONLY = os.getenv("GMAIL_UNSEEN_ONLY", "true").lower() in {
+
+GMAIL_DEBUG = os.getenv("GMAIL_DEBUG", "false").strip().lower() in {"1", "true", "yes"}
+GMAIL_UNSEEN_ONLY = os.getenv("GMAIL_UNSEEN_ONLY", "true").strip().lower() in {
     "1",
     "true",
     "yes",
 }
-# Marcar como leído los mensajes procesados
-GMAIL_MARK_SEEN = os.getenv("GMAIL_MARK_SEEN", "false").lower() in {"1", "true", "yes"}
+GMAIL_MARK_SEEN = os.getenv("GMAIL_MARK_SEEN", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+INPUT_DIR = os.getenv("INPUT_DIR", "./inbox")
+
+SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-# --- Etiquetas desde .env ---
 def _split_labels(raw: str) -> list[str]:
-    # Admite comas, punto y coma y saltos de línea; quita espacios extra
     parts = []
     for token in re.split(r"[,\n;]+", raw or ""):
         t = token.strip()
@@ -44,251 +53,343 @@ def _split_labels(raw: str) -> list[str]:
 _raw_labels = os.getenv("GMAIL_LABELS", "")
 GMAIL_LABELS = _split_labels(_raw_labels)
 
-# Variables por proveedor opcionales (se añaden si existen)
+# Compat con variables antiguas
 for key in (
     "GMAIL_LABEL_VARONA",
     "GMAIL_LABEL_GPA",
     "GMAIL_LABEL_GP",
     "GMAIL_LABEL_GRUPOPENA",
-    "GMAIL_LABEL_MICHELIN",  # soporte explícito Michelin
+    "GMAIL_LABEL_MICHELIN",
 ):
     v = os.getenv(key, "").strip()
     if v:
         GMAIL_LABELS.append(v)
-
-# Fallback si no hay nada configurado
 if not GMAIL_LABELS:
-    GMAIL_LABELS = [
-        "Albaranes compra Varona",
-        "Albaranes compra gpautomocion",
-        "Albaranes compra Michelin",
-    ]
+    GMAIL_LABELS = ["INBOX"]
 
-# Quita duplicados preservando orden
-GMAIL_LABELS = list(dict.fromkeys(GMAIL_LABELS))
 
-# --- Debug de configuración ---
-if GMAIL_DEBUG:
+# =========================
+# Utilidades
+# =========================
+def _debug_env():
     msg = (
-        "[GMAIL] Debug ON | "
-        f"host={IMAP_HOST} | unseen_only={GMAIL_UNSEEN_ONLY} | mark_seen={GMAIL_MARK_SEEN} | "
-        f"env.GMAIL_LABELS_raw={_raw_labels!r} | labels={', '.join(GMAIL_LABELS)}"
+        f"[GMAIL] host={IMAP_HOST} | user={GMAIL_USER} | unseen_only={GMAIL_UNSEEN_ONLY} | "
+        f"mark_seen={GMAIL_MARK_SEEN} | labels={', '.join(GMAIL_LABELS)} | inbox={os.path.abspath(INPUT_DIR)}"
     )
-    print(msg)
     log.debug(msg)
-
-SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-def _decode_folder_line(line: bytes) -> str:
-    """
-    Gmail devuelve líneas tipo: b'(\\HasNoChildren) "/" "Albaranes compra Varona"'
-    Extraemos la última parte entre comillas.
-    """
-    s = line.decode(errors="ignore")
-    parts = s.split(' "/" ')
-    if len(parts) >= 2:
-        return parts[-1].strip().strip('"')
-    # Fallback: última comilla
-    m = re.findall(r'"([^"]+)"', s)
-    return m[-1] if m else s
-
-
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-    log.debug(f"[GMAIL] Ensure dir: {path}")
 
 
 def _sanitize_filename(name: str) -> str:
-    name = name.strip().replace(" ", "_")
-    name = SAFE_NAME_RE.sub("_", name)
-    return name
+    name = (name or "").strip().replace(" ", "_")
+    return SAFE_NAME_RE.sub("_", name) or "adjunto.pdf"
 
 
-def _save_pdf(payload: bytes, dest_dir: str, filename: str) -> str:
-    _ensure_dir(dest_dir)
-    base = _sanitize_filename(filename)
-    target = os.path.join(dest_dir, base)
-    # Evitar sobreescritura
-    if os.path.exists(target):
-        i = 1
-        stem, ext = os.path.splitext(base)
-        while True:
-            candidate = os.path.join(dest_dir, f"{stem}_{i}{ext}")
-            if not os.path.exists(candidate):
-                log.debug(
-                    f"[GMAIL] Renombrado para evitar colisión: {base} -> {os.path.basename(candidate)}"
-                )
-                target = candidate
-                break
-            i += 1
-    with open(target, "wb") as f:
-        f.write(payload)
-    print(f"[GMAIL] Guardado: {os.path.basename(target)}")
-    log.info(f"[GMAIL] Guardado PDF en {target}")
-    return target
+def _decode_rfc_filename(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    try:
+        parts = decode_header(raw)
+        decoded = "".join(
+            (b.decode(enc or "utf-8", errors="ignore") if isinstance(b, bytes) else b)
+            for b, enc in parts
+        ).strip()
+        return decoded or None
+    except Exception:
+        return raw
 
 
-def _select_mailbox(imap: imaplib.IMAP4_SSL, label_hint: str) -> Tuple[bool, str]:
-    # Buscar carpeta que contenga label_hint (case-insensitive)
-    status, boxes = imap.list()
-    if status != "OK":
-        print("[GMAIL] Error listando buzones.")
-        log.error(f"[GMAIL] LIST status != OK ({status})")
-        return False, ""
-    label_hint_up = label_hint.upper()
-    chosen = ""
-    for b in boxes or []:
-        folder = _decode_folder_line(b)
-        if label_hint_up in folder.upper():
-            chosen = folder
-            break
-    if not chosen:
-        log.warning(f"[GMAIL] No se encontró carpeta que contenga: {label_hint}")
+def _list_folders(imap: imaplib.IMAP4_SSL) -> list[str]:
+    try:
+        status, data = imap.list()
+        if status != "OK":
+            return []
+        out = []
+        for raw in data:
+            if not raw:
+                continue
+            s = raw.decode(errors="ignore")
+            m = re.findall(r'"([^"]+)"', s)
+            out.append(m[-1] if m else s)
+        return out
+    except Exception:
+        return []
+
+
+def _find_matching_label(folders: list[str], label_hint: str) -> str | None:
+    for f in folders:
+        if label_hint.lower() in f.lower():
+            return f
+    return None
+
+
+def _select_mailbox(imap: imaplib.IMAP4_SSL, label_hint: str) -> tuple[bool, str]:
+    folders = _list_folders(imap)
+    chosen = _find_matching_label(folders, label_hint) or label_hint
+    if chosen not in folders and label_hint not in folders:
+        log.warning(f"[GMAIL] Carpeta no encontrada: {label_hint}")
         return False, ""
     status, _ = imap.select(f'"{chosen}"')
     ok = status == "OK"
     if ok:
-        if GMAIL_DEBUG:
-            print(f"[GMAIL] Seleccionada carpeta: {chosen}")
         log.info(f"[GMAIL] SELECT '{chosen}' -> OK")
     else:
-        print(f"[GMAIL] No se pudo seleccionar carpeta: {chosen}")
         log.error(f"[GMAIL] SELECT '{chosen}' -> {status}")
     return ok, chosen
 
 
-def fetch_pdfs_from_label(label: str, download_dir: str) -> List[str]:
+def _unique_path(download_dir: str, filename: str) -> str:
+    base = _sanitize_filename(filename)
+    root, ext = os.path.splitext(base)
+    if (not ext) or ext.lower() != ".pdf":
+        ext = ".pdf"
+    path = os.path.join(download_dir, f"{root}{ext}")
+    i = 1
+    while os.path.exists(path):
+        path = os.path.join(download_dir, f"{root}-{i}{ext}")
+        i += 1
+    return path
+
+
+def _part_filename(part: email.message.Message) -> Optional[str]:
+    # 1) get_filename() (RFC2231/RFC2047 aware en parte)
+    fname = part.get_filename()
+    fname = _decode_rfc_filename(fname) if fname else None
+    if fname:
+        return fname
+    # 2) Content-Disposition
+    cd = part.get("Content-Disposition", "")
+    m = re.search(r'filename\*?="?([^";]+)', cd, flags=re.I)
+    if m:
+        return _decode_rfc_filename(m.group(1))
+    # 3) Content-Type name=
+    ct = part.get("Content-Type", "")
+    m = re.search(r'name\*?="?([^";]+)', ct, flags=re.I)
+    if m:
+        return _decode_rfc_filename(m.group(1))
+    return None
+
+
+def _ensure_pdf_extension(filename: str, content_type: str) -> str:
+    root, ext = os.path.splitext(filename)
+    if content_type.lower() == "application/pdf":
+        return f"{root}.pdf" if ext.lower() != ".pdf" else filename
+    # Si el MIME no es pdf pero el nombre termina en .pdf, lo dejamos.
+    if ext.lower() == ".pdf":
+        return filename
+    # Si no hay extensión y parece PDF por MIME secundario
+    guessed = (
+        mimetypes.guess_extension(content_type or "", strict=False) or ""
+    ).lower()
+    if guessed == ".pdf":
+        return f"{root}.pdf"
+    return filename
+
+
+def _is_pdf_part(part: email.message.Message) -> bool:
+    ct = (part.get_content_type() or "").lower()
+    fname = (_part_filename(part) or "").lower()
+    if ct == "application/pdf":
+        return True
+    if ct == "application/octet-stream" and fname.endswith(".pdf"):
+        return True
+    return fname.endswith(".pdf")
+
+
+def _save_pdf(payload: bytes, download_dir: str, filename: str) -> Optional[str]:
+    os.makedirs(download_dir, exist_ok=True)
+    target_path = _unique_path(download_dir, filename or "adjunto.pdf")
+    with open(target_path, "wb") as f:
+        f.write(payload)
+    log.info(f"[GMAIL] PDF guardado: {target_path}")
+    return target_path
+
+
+def _extract_pdfs_from_msg(
+    msg_obj: email.message.Message, download_dir: str
+) -> list[str]:
+    saved: list[str] = []
+    had_any_attachment = False
+
+    for part in msg_obj.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+
+        # .eml anidados
+        if part.get_content_type() == "message/rfc822":
+            try:
+                inner = part.get_payload(0)
+                saved.extend(_extract_pdfs_from_msg(inner, download_dir))
+            except Exception as e:
+                log.debug(f"[GMAIL] message/rfc822 parse error: {e}")
+            continue
+
+        disp = (part.get("Content-Disposition") or "").lower()
+        is_attachment_like = ("attachment" in disp) or bool(_part_filename(part))
+        if is_attachment_like:
+            had_any_attachment = True
+
+        if _is_pdf_part(part):
+            payload = part.get_payload(decode=True)
+            if not payload:
+                if GMAIL_DEBUG:
+                    log.debug("[GMAIL] Parte PDF sin payload decodificable.")
+                continue
+            fname = _part_filename(part) or "adjunto.pdf"
+            fname = _ensure_pdf_extension(fname, part.get_content_type())
+            path = _save_pdf(payload, download_dir, fname)
+            if path:
+                saved.append(path)
+
+    if had_any_attachment and not saved and GMAIL_DEBUG:
+        log.debug("[GMAIL] Mensaje con adjuntos pero ninguno PDF válido para guardar.")
+    if not had_any_attachment and GMAIL_DEBUG:
+        log.debug("[GMAIL] Mensaje sin adjuntos.")
+    return saved
+
+
+def _gmail_search_with_pdf_hint(imap: imaplib.IMAP4_SSL) -> list[bytes]:
+    """
+    Busca mensajes NO LEÍDOS con adjuntos PDF.
+    Prioriza X-GM-RAW de Gmail, con comillas para evitar 'Could not parse command'.
+    """
+    try:
+        raw = "has:attachment filename:pdf"
+        if GMAIL_UNSEEN_ONLY:
+            raw = f"({raw}) is:unread"
+        # Importante: envolver entre comillas la query completa
+        status, data = imap.uid("SEARCH", None, "X-GM-RAW", f'"{raw}"')
+        if status == "OK":
+            return data[0].split()
+    except Exception as e:
+        log.debug(f"[GMAIL] X-GM-RAW fallback por: {e}")
+
+    # Fallback a UNSEEN y filtrado manual
+    criterion = "UNSEEN" if GMAIL_UNSEEN_ONLY else "ALL"
+    status, data = imap.search(None, criterion)
+    return data[0].split() if status == "OK" else []
+
+
+# =========================
+# Flujo principal por etiqueta
+# =========================
+def fetch_pdfs_from_label(label: str, download_dir: str) -> Tuple[List[str], int]:
+    """
+    Descarga PDFs de una etiqueta concreta.
+    Retorna (lista_de_rutas_guardadas, total_mensajes_no_leidos_encontrados)
+    """
     saved: List[str] = []
+    unread_count = 0
+    start_ts = time.time()
+
     try:
         imap = imaplib.IMAP4_SSL(IMAP_HOST)
         imap.login(GMAIL_USER, GMAIL_PASSWORD)
-        log.info(f"[GMAIL] LOGIN OK en {IMAP_HOST}")
+        log.info(f"[GMAIL] LOGIN OK en {IMAP_HOST} como {GMAIL_USER}")
     except Exception as e:
-        print(f"[GMAIL] Error de conexión/login IMAP: {e}")
-        log.exception("[GMAIL] Error de conexión/login IMAP")
-        return saved
+        log.exception(f"[GMAIL] Error de conexión/login IMAP: {e}")
+        return saved, unread_count
 
     try:
         ok, selected = _select_mailbox(imap, label)
         if not ok:
-            print(f"[GMAIL] Etiqueta no encontrada: {label}")
-            log.warning(f"[GMAIL] Etiqueta no encontrada: {label}")
-            if GMAIL_DEBUG:
-                tip = "[GMAIL] Sugerencia: uv run python -c 'from core.gmail_downloader import debug_list; debug_list()'"
-                print(tip)
-                log.debug(tip)
-            imap.logout()
-            return saved
+            log.error(f"[GMAIL] Etiqueta no encontrada: {label}")
+            return saved, unread_count
 
-        # 1ª pasada: UNSEEN; si 0 y debug activo, probar ALL para diagnóstico
-        criterion = "(UNSEEN)" if GMAIL_UNSEEN_ONLY else "ALL"
-        status, result = imap.search(None, criterion)
-        if status != "OK":
-            print(f"[GMAIL] Error al buscar mensajes en: {selected}")
-            log.error(f"[GMAIL] SEARCH {criterion} -> {status} en {selected}")
-            imap.logout()
-            return saved
+        os.makedirs(download_dir, exist_ok=True)
 
-        ids = result[0].split()
-        if GMAIL_DEBUG:
-            print(f"[GMAIL] Mensajes encontrados con {criterion}: {len(ids)}")
-        log.info(f"[GMAIL] {selected}: {len(ids)} mensajes con {criterion}")
-
-        # fallback de diagnóstico
-        if GMAIL_UNSEEN_ONLY and not ids and GMAIL_DEBUG:
-            status2, result2 = imap.search(None, "ALL")
-            ids2 = result2[0].split() if status2 == "OK" else []
-            msg = f"[GMAIL] Diagnóstico: con ALL hay {len(ids2)} mensajes (UNSEEN=0). ¿Están marcados como leídos?"
-            print(msg)
-            log.debug(msg)
+        ids = _gmail_search_with_pdf_hint(imap)
+        unread_count = len(ids)
+        log.info(
+            f"[GMAIL] Etiqueta '{selected}': NO LEÍDOS con PDFs encontrados: {unread_count}"
+        )
 
         for num in ids:
             try:
-                _, data = imap.fetch(num, "(RFC822)")
+                typ, data = imap.uid("FETCH", num, "(RFC822)")
+                if typ != "OK" or not data or not data[0]:
+                    if GMAIL_DEBUG:
+                        log.debug(f"[GMAIL] UID FETCH falló para {num!r}")
+                    continue
                 msg_obj = email.message_from_bytes(data[0][1])
+
+                # Descargar solo PDFs
+                paths = _extract_pdfs_from_msg(msg_obj, download_dir)
+                for p in paths:
+                    log.info(f"[GMAIL] Descargado: {os.path.basename(p)}")
+
+                # Marcar como leído solo si hubo descarga de al menos un PDF
+                if GMAIL_MARK_SEEN and paths:
+                    try:
+                        imap.uid("STORE", num, "+FLAGS", r"(\Seen)")
+                        if GMAIL_DEBUG:
+                            log.debug(f"[GMAIL] Marcado como leído UID={num.decode()}")
+                    except Exception as e:
+                        log.warning(
+                            f"[GMAIL] No se pudo marcar como leído UID={num.decode()}: {e}"
+                        )
+
+                saved.extend(paths)
+
             except Exception as e:
-                print(f"[GMAIL] Error al recuperar mensaje {num!r}: {e}")
-                log.exception(f"[GMAIL] FETCH fallo en msg {num!r}")
-                continue
+                log.exception(f"[GMAIL] Error procesando mensaje UID={num!r}: {e}")
+                # Continuar con el resto
 
-            attach_count = 0
-            for part in msg_obj.walk():
-                # Detección de adjunto PDF más tolerante
-                ct = (part.get_content_type() or "").lower()
-                disp = (part.get("Content-Disposition") or "").lower()
-                fname = part.get_filename()
+        elapsed = time.time() - start_ts
+        log.info(
+            f"[GMAIL] Etiqueta '{selected}' completada. PDFs nuevos: {len(saved)} | "
+            f"Correos no leídos inspeccionados: {unread_count} | t={elapsed:.2f}s"
+        )
+        return saved, unread_count
 
-                is_pdf = (fname and fname.lower().endswith(".pdf")) or (
-                    ct == "application/pdf"
-                )
-                is_attachment = ("attachment" in disp) or bool(fname)
-
-                if is_pdf and is_attachment:
-                    payload = part.get_payload(decode=True)
-                    if not payload:
-                        log.debug("[GMAIL] Parte PDF sin payload, se ignora.")
-                        continue
-                    name = fname or "adjunto.pdf"
-                    path = _save_pdf(payload, download_dir, name)
-                    saved.append(path)  # <-- AÑADIR AL LISTADO
-                    attach_count += 1
-
-            if attach_count == 0 and GMAIL_DEBUG:
-                print("[GMAIL] Mensaje sin adjuntos PDF válidos.")
-                log.debug("[GMAIL] Mensaje sin adjuntos PDF válidos.")
-
-            if GMAIL_MARK_SEEN and attach_count > 0:
-                imap.store(num, "+FLAGS", "\\Seen")
-                log.debug(
-                    f"[GMAIL] Marcado como leído msg {num.decode(errors='ignore')}"
-                )
-
-    except Exception as e:
-        print(f"[GMAIL] Error procesando etiqueta '{label}': {e}")
-        log.exception(f"[GMAIL] Error procesando etiqueta '{label}'")
     finally:
         try:
+            imap.close()
+        except Exception:
+            pass
+        try:
             imap.logout()
-            log.debug("[GMAIL] LOGOUT")
         except Exception:
             pass
 
-    return saved
 
+# =========================
+# Flujo multi-etiqueta
+# =========================
+def fetch_from_labels(
+    download_dir: str, labels: Iterable[str] | None = None
+) -> List[str]:
+    """
+    Punto de entrada multi-etiqueta. Descarga ÚNICAMENTE PDFs.
+    """
+    _debug_env()
+    labels = list(labels) if labels else list(GMAIL_LABELS) or ["INBOX"]
 
-def fetch_all(download_dir: str, labels: Iterable[str] | None = None) -> List[str]:
-    labels = (
-        list(labels) if labels else [l for l in (x.strip() for x in GMAIL_LABELS) if l]
-    )
-    all_saved: List[str] = []
-    if not labels:
-        msg = "[GMAIL] No hay etiquetas configuradas. Define GMAIL_LABELS o GMAIL_LABEL_* en .env"
-        print(msg)
-        log.info(msg)
-        return all_saved
+    os.makedirs(download_dir, exist_ok=True)
+
+    total_saved: List[str] = []
+    total_pdfs = 0
+    total_unread = 0
+
+    log.info("[GMAIL] Inicio de proceso multi-etiqueta")
     for label in labels:
-        print(f"[GMAIL] Procesando etiqueta: {label}")
         log.info(f"[GMAIL] Procesando etiqueta: {label}")
-        saved = fetch_pdfs_from_label(label, download_dir)
-        all_saved.extend(saved)
-    print(f"[GMAIL] Total PDFs guardados: {len(all_saved)}")
-    log.info(f"[GMAIL] Total PDFs guardados: {len(all_saved)}")
-    return all_saved
+        saved, unread = fetch_pdfs_from_label(label, download_dir)
+        total_unread += unread
+        total_pdfs += len(saved)
+        total_saved.extend(saved)
+        log.info(
+            f"[GMAIL] Resumen parcial '{label}': no leídos={unread}, PDFs descargados={len(saved)}"
+        )
+
+    log.info(
+        f"[GMAIL] RESUMEN FINAL: etiquetas={len(labels)}, no leídos totales={total_unread}, PDFs descargados={total_pdfs}"
+    )
+    return total_saved
 
 
-def debug_list() -> None:
+# Atajo CLI sencillo si se ejecuta directamente
+if __name__ == "__main__":
     try:
-        imap = imaplib.IMAP4_SSL(IMAP_HOST)
-        imap.login(GMAIL_USER, GMAIL_PASSWORD)
-        status, boxes = imap.list()
-        print(f"[GMAIL] list status={status}")
-        log.info(f"[GMAIL] LIST status={status}")
-        for b in boxes or []:
-            folder = _decode_folder_line(b)
-            print("  ", folder)
-            log.debug(f"[GMAIL] Carpeta: {folder}")
-        imap.logout()
+        fetch_from_labels(INPUT_DIR, GMAIL_LABELS)
     except Exception as e:
-        print(f"[GMAIL] Error listando buzones: {e}")
-        log.exception("[GMAIL] Error listando buzones")
+        log.exception(f"[GMAIL] Error no controlado en ejecución principal: {e}")

@@ -1,406 +1,678 @@
 # core/odoo_importer.py
 from __future__ import annotations
 
-import math
+import hashlib
 import os
 import re
 import xmlrpc.client
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
 
-
-def _env():
-    load_dotenv()
-    return {
-        "url": os.getenv("ODOO_URL", "").rstrip("/"),
-        "db": os.getenv("ODOO_DB", ""),
-        "user": os.getenv("ODOO_USER", ""),
-        "password": os.getenv("ODOO_PASSWORD", ""),
-        "company_id": int(os.getenv("ODOO_COMPANY_ID", "1")),
-    }
+# ---------- Utilidades ----------
+SKU_BRACKET_RE = re.compile(r"\[(.*?)\]")
+SKU_LEADING_RE = re.compile(r"^([A-Za-z0-9\-\._]+)")
+WHITES_RE = re.compile(r"\s+")
 
 
-def _connect(e):
-    common = xmlrpc.client.ServerProxy(f"{e['url']}/xmlrpc/2/common")
-    uid = common.authenticate(e["db"], e["user"], e["password"], {})
-    if not uid:
-        raise RuntimeError("❌ Autenticación Odoo fallida")
-    models = xmlrpc.client.ServerProxy(f"{e['url']}/xmlrpc/2/object")
-    return uid, models
+def _normalize_default_code(s: str) -> str:
+    """
+    Normaliza la referencia interna para homogeneizar:
+    - Quita espacios repetidos
+    - Mantiene mayúsculas/tildes
+    - No elimina guiones ni puntos (muy usados en ref. proveedor)
+    """
+    if s is None:
+        return ""
+    s = str(s).strip()
+    s = WHITES_RE.sub("", s)
+    return s
 
 
-def _extract_code(prod_field: str) -> str:
-    # Si viene como "[CODE] Descripción" extrae CODE; si no, devuelve tal cual
-    m = re.match(r"\s*\[([^\]]+)\]", str(prod_field))
-    return m.group(1).strip() if m else str(prod_field).strip()
-
-
-def _find_partner(models, e, uid, name: str) -> Optional[int]:
-    args = [[("name", "=", name), ("supplier_rank", ">", 0)]]
-    ids = models.execute_kw(
-        e["db"], uid, e["password"], "res.partner", "search", args, {"limit": 1}
-    )
-    if not ids:
-        args = [[("name", "ilike", name), ("supplier_rank", ">", 0)]]
-        ids = models.execute_kw(
-            e["db"], uid, e["password"], "res.partner", "search", args, {"limit": 1}
-        )
-    return ids[0] if ids else None
-
-
-def _find_receipts_type(models, e, uid, warehouse_name: str) -> Optional[int]:
-    if not warehouse_name:
-        return None
-    wids = models.execute_kw(
-        e["db"],
-        uid,
-        e["password"],
-        "stock.warehouse",
-        "search",
-        [[("name", "ilike", warehouse_name)]],
-        {"limit": 1},
-    )
-    if not wids:
-        return None
-    pt = models.execute_kw(
-        e["db"],
-        uid,
-        e["password"],
-        "stock.picking.type",
-        "search",
-        [[("code", "=", "incoming"), ("warehouse_id", "=", wids[0])]],
-        {"limit": 1},
-    )
-    return pt[0] if pt else None
-
-
-def _to_float(x, default: float = 0.0) -> float:
-    """Convierte a float aceptando '', 'nan', None y coma decimal."""
-    if x is None:
-        return default
-    if isinstance(x, float) and math.isnan(x):
-        return default
-    s = str(x).strip()
-    if s == "" or s.lower() == "nan":
-        return default
-    # si hay una sola coma decimal, cámbiala por punto
-    if s.count(",") == 1 and s.count(".") == 0:
-        s = s.replace(",", ".")
+def _parse_qty(val: str, default: float = 0.0) -> float:
     try:
+        s = str(val).strip()
+        if not s:
+            return default
+        has_comma = "," in s
+        has_dot = "." in s
+        if has_comma and has_dot:
+            if s.rfind(".") > s.rfind(","):
+                s = s.replace(",", "")
+            else:
+                s = s.replace(".", "").replace(",", ".")
+        elif has_comma and not has_dot:
+            s = s.replace(",", ".")
         return float(s)
     except Exception:
         return default
 
 
-def _find_product(models, e, uid, code: str) -> Optional[Tuple[int, int]]:
+def _parse_price(val: str, default: float = 0.0) -> float:
+    try:
+        s = str(val).strip()
+        if not s:
+            return default
+        has_comma = "," in s
+        has_dot = "." in s
+        if has_comma and has_dot:
+            if s.rfind(".") > s.rfind(","):
+                s = s.replace(",", "")
+            else:
+                s = s.replace(".", "").replace(",", ".")
+        elif has_comma and not has_dot:
+            s = s.replace(",", ".")
+        return float(s)
+    except Exception:
+        return default
+
+
+def _parse_disc(val: str, default: float = 0.0) -> float:
+    try:
+        s = str(val).strip()
+        if not s:
+            return default
+        has_comma = "," in s
+        has_dot = "." in s
+        if has_comma and has_dot:
+            if s.rfind(".") > s.rfind(","):
+                s = s.replace(",", "")
+            else:
+                s = s.replace(".", "").replace(",", ".")
+        elif has_comma and not has_dot:
+            s = s.replace(",", ".")
+        return float(s)
+    except Exception:
+        return default
+
+
+def _extract_code(val: str) -> str:
+    if val is None:
+        return ""
+    return str(val).strip()
+
+
+def _extract_sku(raw: str) -> str:
     """
-    Búsqueda general (proveedores no Michelin):
-    - Exacta por default_code
-    - Fallback por ilike
-    Devuelve (product_id, uom_po_id)
+    Obtiene el SKU 'puro' del campo Producto del CSV.
+    Ej.: '[LP3260PASTILLAS...]' -> 'LP3260'
     """
-    if not code:
+    if not raw:
+        return ""
+    m = SKU_BRACKET_RE.search(raw)
+    if m:
+        inside = m.group(1).strip()
+        mld = re.match(r"^([A-Za-z]{1,10}\d{2,15})", inside)
+        if mld:
+            return _normalize_default_code(mld.group(1))
+        mtok = re.match(r"^([A-Za-z0-9]+)", inside)
+        if mtok:
+            return _normalize_default_code(mtok.group(1))
+        return _normalize_default_code(inside)
+    m2 = SKU_LEADING_RE.search(str(raw))
+    if m2:
+        return _normalize_default_code(m2.group(1))
+    return _normalize_default_code(str(raw))
+
+
+def _env() -> Dict[str, Any]:
+    load_dotenv()
+    return {
+        "url": os.getenv("ODOO_URL", "").strip(),
+        "db": os.getenv("ODOO_DB", "").strip(),
+        "user": os.getenv("ODOO_USER", "").strip(),
+        "password": os.getenv("ODOO_PASSWORD", "").strip(),
+        "price_is_net": os.getenv("IMPORT_PRICE_IS_NET", "1").strip()
+        in ("1", "true", "True"),
+        "dedup_by_partner_ref": os.getenv("DEDUP_BY_PARTNER_REF", "1").strip()
+        in ("1", "true", "True"),
+        "force": os.getenv("FORCE_IMPORT", "0").strip() in ("1", "true", "True"),
+    }
+
+
+def _connect(e: Dict[str, Any]) -> Tuple[int, Any]:
+    common = xmlrpc.client.ServerProxy(f"{e['url']}/xmlrpc/2/common")
+    uid = common.authenticate(e["db"], e["user"], e["password"], {})
+    if not uid:
+        raise RuntimeError("No se pudo autenticar en Odoo. Revisa credenciales.")
+    models = xmlrpc.client.ServerProxy(f"{e['url']}/xmlrpc/2/object")
+    return uid, models
+
+
+# ---------- Búsquedas ----------
+def _find_partner(models, e, uid, name: str) -> Optional[int]:
+    """Primero intenta como proveedor; si no, relaja el filtro."""
+    if not name:
         return None
+    domain_strict = [
+        "&",
+        "|",
+        ("name", "ilike", name),
+        ("display_name", "ilike", name),
+        ("supplier_rank", ">", 0),
+    ]
     ids = models.execute_kw(
         e["db"],
         uid,
         e["password"],
-        "product.product",
+        "res.partner",
+        "search",
+        [domain_strict],
+        {"limit": 1},
+    )
+    if ids:
+        return ids[0]
+    domain_relaxed = ["|", ("name", "ilike", name), ("display_name", "ilike", name)]
+    ids = models.execute_kw(
+        e["db"],
+        uid,
+        e["password"],
+        "res.partner",
+        "search",
+        [domain_relaxed],
+        {"limit": 1},
+    )
+    return ids[0] if ids else None
+
+
+def _find_uom_ids(models, e, uid) -> Tuple[Optional[int], Optional[int]]:
+    uom_ids = models.execute_kw(
+        e["db"],
+        uid,
+        e["password"],
+        "uom.uom",
+        "search",
+        [[("category_id.name", "=", "Unit")]],
+        {"limit": 1},
+    )
+    uom_id = uom_ids[0] if uom_ids else None
+    return uom_id, uom_id
+
+
+def _find_product_by_default_code(
+    models, e, uid, code: str
+) -> Optional[Tuple[int, Optional[int]]]:
+    if not code:
+        return None
+    tmpl_ids = models.execute_kw(
+        e["db"],
+        uid,
+        e["password"],
+        "product.template",
         "search",
         [[("default_code", "=", code)]],
         {"limit": 1},
     )
-    if not ids:
-        ids = models.execute_kw(
+    if tmpl_ids:
+        tmpl = models.execute_kw(
+            e["db"],
+            uid,
+            e["password"],
+            "product.template",
+            "read",
+            [tmpl_ids, ["uom_po_id"]],
+        )[0]
+        product_ids = models.execute_kw(
             e["db"],
             uid,
             e["password"],
             "product.product",
             "search",
-            [[("default_code", "ilike", code)]],
+            [[("product_tmpl_id", "=", tmpl_ids[0])]],
             {"limit": 1},
         )
-    if not ids:
-        return None
-    rec = models.execute_kw(
-        e["db"], uid, e["password"], "product.product", "read", [ids, ["uom_po_id"]]
-    )[0]
-    uom_po_id = rec["uom_po_id"][0] if rec.get("uom_po_id") else None
-    return ids[0], uom_po_id
+        if product_ids:
+            uom_po_id = tmpl["uom_po_id"][0] if tmpl.get("uom_po_id") else None
+            return product_ids[0], uom_po_id
+    return None
 
 
-def _find_product_vendor_cai(
-    models, e, uid, partner_id: int, cai: str
-) -> Optional[Tuple[int, int]]:
+def _find_product_by_default_code_partial(
+    models, e, uid, needles: List[str]
+) -> Optional[Tuple[int, Optional[int]]]:
+    """Búsqueda por coincidencia parcial en product.template.default_code.
+
+    Estrategia:
+      - Para cada "needle" (posibles códigos de proveedor), buscar templates cuyo default_code ILIKE %needle%.
+      - Ranquear: mejor si default_code termina en needle; luego si lo contiene.
+      - Empate: default_code más corto y write_date más reciente (según orden).
+    Retorna (product_id, uom_po_id) si hay candidato.
     """
-    Búsqueda limitada al proveedor (para Michelin):
-    - Filtra productos cuyo template tenga seller del partner dado
-    - Busca default_code ILIKE CAI
-    - Prioriza los que acaban en CAI (convención '...MIC<CAI>')
-    Devuelve (product_id, uom_po_id)
-    """
-    if not cai or not partner_id:
+    # Normaliza agujas: quitar espacios, mayúsculas
+    clean_needles: List[str] = []
+    for n in needles or []:
+        if not n:
+            continue
+        ns = str(n).strip()
+        if not ns:
+            continue
+        clean_needles.append(ns.upper())
+    if not clean_needles:
         return None
 
-    domain = [
-        ("product_tmpl_id.seller_ids.name", "=", partner_id),
-        ("default_code", "ilike", cai),
-    ]
-    res: List[Dict] = models.execute_kw(
-        e["db"],
-        uid,
-        e["password"],
-        "product.product",
-        "search_read",
-        [domain],
-        {"fields": ["id", "default_code", "uom_po_id"], "limit": 50},
+    best = (
+        None  # (score, -len(default_code), write_date, tmpl_id, uom_po_id, product_id)
+    )
+    seen = set()
+
+    def _score(dc: str, needle: str) -> int:
+        sdc = (dc or "").upper()
+        if not sdc or not needle:
+            return 0
+        if sdc == needle:
+            return 100
+        if sdc.endswith(needle):
+            return 90
+        if needle in sdc:
+            return 80
+        return 0
+
+    for needle in clean_needles:
+        try:
+            tmpl_recs = models.execute_kw(
+                e["db"],
+                uid,
+                e["password"],
+                "product.template",
+                "search_read",
+                [[("default_code", "ilike", needle)]],
+                {
+                    "fields": ["id", "default_code", "uom_po_id", "write_date"],
+                    "limit": 50,
+                    "order": "write_date desc",
+                },
+            )
+        except Exception:
+            tmpl_recs = []
+        for rec in tmpl_recs or []:
+            tid = rec.get("id")
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            dc = rec.get("default_code") or ""
+            sc = _score(dc, needle)
+            if sc <= 0:
+                continue
+            try:
+                product_ids = models.execute_kw(
+                    e["db"],
+                    uid,
+                    e["password"],
+                    "product.product",
+                    "search",
+                    [[("product_tmpl_id", "=", tid)]],
+                    {"limit": 1},
+                )
+            except Exception:
+                product_ids = []
+            if not product_ids:
+                continue
+            uom_po_id = rec["uom_po_id"][0] if rec.get("uom_po_id") else None
+            key = (
+                sc,
+                -len(dc),
+                rec.get("write_date") or "",
+                tid,
+                uom_po_id,
+                product_ids[0],
+            )
+            if best is None or key > best:
+                best = key
+
+    if best:
+        _, _, _, _tid, uom_po_id, product_id = best
+        return product_id, uom_po_id
+    return None
+
+
+def _create_product(
+    models, e, uid, default_code: str, name: str, supplier_id: int
+) -> Tuple[int, Optional[int]]:
+    uom_id, uom_po_id = _find_uom_ids(models, e, uid)
+    tmpl_vals = {
+        "name": name or default_code,
+        "default_code": default_code,
+        "type": "product",
+        "purchase_ok": True,
+        "sale_ok": True,
+    }
+    if uom_id:
+        tmpl_vals["uom_id"] = uom_id
+    if uom_po_id:
+        tmpl_vals["uom_po_id"] = uom_po_id
+
+    tmpl_id = models.execute_kw(
+        e["db"], uid, e["password"], "product.template", "create", [tmpl_vals]
     )
 
-    if res:
-        ending = [
-            r
-            for r in res
-            if (r.get("default_code") or "").upper().endswith(cai.upper())
-        ]
-        pick = ending[0] if ending else res[0]
-        uom_po_id = pick["uom_po_id"][0] if pick.get("uom_po_id") else None
-        return pick["id"], uom_po_id
-
-    # Fallback general
-    return _find_product(models, e, uid, cai)
-
-
-# ---------- utilidades de precios ----------
-
-
-def _get_company_currency(models, e, uid) -> int:
-    comp = models.execute_kw(
-        e["db"],
-        uid,
-        e["password"],
-        "res.company",
-        "read",
-        [[e["company_id"]], ["currency_id"]],
-    )[0]
-    return comp["currency_id"][0]
-
-
-def _currency_convert(
-    models,
-    e,
-    uid,
-    amount: float,
-    from_currency_id: int,
-    to_currency_id: int,
-    date_str: str,
-) -> float:
-    """Convierte divisa en Odoo; si falla, devuelve el mismo amount."""
-    try:
-        res = models.execute_kw(
-            e["db"],
-            uid,
-            e["password"],
-            "res.currency",
-            "_convert",
-            [
-                [from_currency_id],
-                amount,
-                to_currency_id,
-                e["company_id"],
-                date_str,
-                True,
-            ],
-        )
-        return float(res)
-    except Exception:
-        return amount
-
-
-def _get_purchase_price_for_line(
-    models,
-    e,
-    uid,
-    product_id: int,
-    partner_id: int,
-    qty: float,
-    date_planned: str,
-) -> float:
-    """
-    Precio de compra en moneda de compañía:
-    1) product.supplierinfo del partner (vigente y con min_qty <= qty)
-    2) standard_price del producto
-    """
-    prec = models.execute_kw(
+    product_ids = models.execute_kw(
         e["db"],
         uid,
         e["password"],
         "product.product",
-        "read",
-        [[product_id], ["product_tmpl_id", "standard_price"]],
-    )[0]
-    tmpl_id = prec["product_tmpl_id"][0]
-    standard_price = float(prec.get("standard_price") or 0.0)
-
-    si_domain = [
-        ("name", "=", partner_id),
-        ("product_tmpl_id", "=", tmpl_id),
-        "|",
-        ("date_start", "=", False),
-        ("date_start", "<=", date_planned),
-        "|",
-        ("date_end", "=", False),
-        ("date_end", ">=", date_planned),
-        ("min_qty", "<=", qty or 0),
-    ]
-    si_ids = models.execute_kw(
-        e["db"],
-        uid,
-        e["password"],
-        "product.supplierinfo",
         "search",
-        [si_domain],
+        [[("product_tmpl_id", "=", tmpl_id)]],
         {"limit": 1},
     )
+    product_id = product_ids[0] if product_ids else None
 
-    if si_ids:
-        si = models.execute_kw(
+    try:
+        models.execute_kw(
             e["db"],
             uid,
             e["password"],
             "product.supplierinfo",
-            "read",
-            [si_ids, ["price", "currency_id"]],
-        )[0]
-        price = float(si.get("price") or 0.0)
-        if price > 0:
-            comp_cur = _get_company_currency(models, e, uid)
-            cur = si.get("currency_id")
-            cur_id = cur[0] if isinstance(cur, (list, tuple)) else (cur or comp_cur)
-            if cur_id != comp_cur:
-                price = _currency_convert(
-                    models, e, uid, price, cur_id, comp_cur, date_planned
-                )
-            return price
+            "create",
+            [
+                {
+                    "name": supplier_id,
+                    "product_tmpl_id": tmpl_id,
+                    "product_name": name or default_code,
+                    "product_code": default_code,
+                }
+            ],
+        )
+    except Exception:
+        pass
 
-    return standard_price
-
-
-# ---------- Import principal ----------
+    return product_id, uom_po_id
 
 
-def import_csv(csv_path: str | Path) -> None:
-    e = _env()
-    missing = [k for k in ("url", "db", "user", "password") if not e[k]]
-    if missing:
-        print(f"[ODOO] Falta .env: {', '.join(missing)}. No se importa: {csv_path}")
-        return
+def _find_incoming_picking(models, e, uid, entregar_a: str) -> Optional[int]:
+    """
+    Usa el picking de entrada del almacén indicado en "Entregar a".
+    Si no se encuentra, hace fallback al primer picking de entrada disponible.
+    """
+    if entregar_a:
+        wh_ids = models.execute_kw(
+            e["db"],
+            uid,
+            e["password"],
+            "stock.warehouse",
+            "search",
+            [[("name", "ilike", entregar_a)]],
+            {"limit": 1},
+        )
+        if wh_ids:
+            wh = models.execute_kw(
+                e["db"],
+                uid,
+                e["password"],
+                "stock.warehouse",
+                "read",
+                [wh_ids, ["in_type_id"]],
+            )[0]
+            in_type = wh.get("in_type_id")
+            if in_type:
+                return in_type[0]
 
-    uid, models = _connect(e)
-    df = pd.read_csv(csv_path)
+        pt_ids = models.execute_kw(
+            e["db"],
+            uid,
+            e["password"],
+            "stock.picking.type",
+            "search",
+            [[("name", "ilike", entregar_a), ("code", "=", "incoming")]],
+            {"limit": 1},
+        )
+        if pt_ids:
+            return pt_ids[0]
 
-    proveedor = str(df.iloc[0].get("Proveedor", "")).strip()
-
-    # Limpiar NaN en referencia
-    ref_cell = df.iloc[0].get("Referencia de proveedor", "")
-    if pd.isna(ref_cell) or str(ref_cell).strip().lower() == "nan":
-        ref = ""
-    else:
-        ref = str(ref_cell).strip()
-
-    destino = str(df.iloc[0].get("Entregar a", "")).strip()
-
-    # Evitar duplicados por partner_ref (usa Nº de albarán en Michelin)
-    exists = models.execute_kw(
+    pt_ids = models.execute_kw(
         e["db"],
         uid,
         e["password"],
-        "purchase.order",
+        "stock.picking.type",
         "search",
-        [[("partner_ref", "=", ref), ("state", "!=", "cancel")]],
+        [[("code", "=", "incoming")]],
         {"limit": 1},
     )
-    if exists:
-        print(f"[ODOO] PO ya existe con ref '{ref}' (id {exists[0]}). Saltado.")
-        return
+    return pt_ids[0] if pt_ids else None
+
+
+# ---------- Hash de import ----------
+def _compute_import_hash(
+    csv_path: Path, partner_id: int, ref: str, df: pd.DataFrame
+) -> str:
+    h = hashlib.sha256()
+    h.update(str(partner_id).encode())
+    h.update((ref or "").encode())
+    h.update(str(csv_path).encode())
+    for _, row in df.iterrows():
+        base = "|".join(
+            [
+                (row.get("Líneas del pedido/Producto") or "").strip(),
+                (row.get("Líneas del pedido/Descripción") or "").strip(),
+                (row.get("Líneas del pedido/Cantidad") or "").strip(),
+                (row.get("Líneas del pedido/Precio unitario") or "").strip(),
+                (row.get("Líneas del pedido/(%) Descuento") or "").strip(),
+            ]
+        )
+        h.update(base.encode())
+    return h.hexdigest()
+
+
+# ---------- Import principal ----------
+def import_csv(csv_path: str) -> None:
+    e = _env()
+    if not all([e["url"], e["db"], e["user"], e["password"]]):
+        raise RuntimeError("Faltan ODOO_URL/DB/USER/PASSWORD en entorno.")
+
+    uid, models = _connect(e)
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"No existe: {csv_path}")
+
+    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False, sep=",")
+    df.fillna("", inplace=True)
+
+    needed = [
+        "Proveedor",
+        "Referencia de proveedor",
+        "Entregar a",
+        "Líneas del pedido/Producto",
+        "Líneas del pedido/Descripción",
+        "Líneas del pedido/Cantidad",
+        "Líneas del pedido/Precio unitario",
+        "Líneas del pedido/(%) Descuento",
+    ]
+    for col in needed:
+        if col not in df.columns:
+            print(f"[SKIPPED] CSV inválido: falta columna '{col}'")
+            return
+
+    proveedor = (df["Proveedor"].iloc[0] or "").strip()
+    ref = (df["Referencia de proveedor"].iloc[0] or "").strip()
+    entregar_a = (df["Entregar a"].iloc[0] or "").strip()
 
     partner_id = _find_partner(models, e, uid, proveedor)
     if not partner_id:
-        print(f"[ODOO] Proveedor no encontrado: '{proveedor}'. Saltado.")
+        print(f"[SKIPPED] Proveedor no encontrado: '{proveedor}'")
         return
 
-    picking_type_id = _find_receipts_type(models, e, uid, destino)
-    date_planned = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+    force = e["force"]
+    if e["dedup_by_partner_ref"] and ref:
+        exists = models.execute_kw(
+            e["db"],
+            uid,
+            e["password"],
+            "purchase.order",
+            "search",
+            [
+                [
+                    ("partner_ref", "=", ref),
+                    ("partner_id", "=", partner_id),
+                    ("state", "!=", "cancel"),
+                ]
+            ],
+            {"limit": 1},
+        )
+        if exists and not force:
+            print(f"[SKIPPED] Ya existe PO con partner_ref='{ref}' (id {exists[0]}).")
+            return
 
-    lines, missing_codes = [], set()
-    is_michelin = proveedor.strip().upper().startswith("MICHELIN")
+    # Dedupe por hash de contenido
+    try:
+        import_hash = _compute_import_hash(csv_path, partner_id, ref, df)
+        dup_by_hash = models.execute_kw(
+            e["db"],
+            uid,
+            e["password"],
+            "purchase.order",
+            "search",
+            [
+                [
+                    ("x_import_hash", "=", import_hash),
+                    ("partner_id", "=", partner_id),
+                    ("state", "!=", "cancel"),
+                ]
+            ],
+            {"limit": 1},
+        )
+        if dup_by_hash and not force:
+            print(
+                f"[SKIPPED] Ya existe PO con el mismo x_import_hash (id {dup_by_hash[0]})."
+            )
+            return
+        elif dup_by_hash:
+            print(
+                f"[WARN] Duplicado por x_import_hash (id {dup_by_hash[0]}). Continuo igualmente."
+            )
+    except Exception:
+        import_hash = ""
 
-    for _, r in df.iterrows():
-        code = _extract_code(r.get("Líneas del pedido/Producto", ""))
-        desc = str(r.get("Líneas del pedido/Descripción", "") or "")
-        qty = _to_float(r.get("Líneas del pedido/Cantidad", 0))
-        price = _to_float(r.get("Líneas del pedido/Precio unitario", 0))
-        disc = _to_float(r.get("Líneas del pedido/(%) Descuento", 0))
+    picking_type_id = _find_incoming_picking(models, e, uid, entregar_a)
 
-        if is_michelin:
-            # 'code' es el CAI del PDF -> buscar dentro del catálogo del proveedor
-            found = _find_product_vendor_cai(models, e, uid, partner_id, code)
-        else:
-            found = _find_product(models, e, uid, code)
+    lines: List[Tuple[int, int, Dict[str, Any]]] = []
+    missing_codes: set[str] = set()
+    date_planned = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-        if not found:
-            missing_codes.add(code)
+    # CAMBIO: detectar si el pedido contiene al menos una línea con cantidad negativa (abono)
+    is_refund_order = any(
+        _parse_qty(x, 0.0) < 0 for x in df["Líneas del pedido/Cantidad"]
+    )
+
+    for _, row in df.iterrows():
+        raw_prod = _extract_code(row["Líneas del pedido/Producto"])
+        desc = _extract_code(row["Líneas del pedido/Descripción"])
+        sku = _extract_sku(raw_prod)
+        qty_raw = _parse_qty(row["Líneas del pedido/Cantidad"], 0.0)
+        price = _parse_price(row["Líneas del pedido/Precio unitario"])
+        disc = _parse_disc(row["Líneas del pedido/(%) Descuento"])
+
+        # CAMBIO: aceptamos negativas; solo descartamos 0 o SKU vacío
+        if not sku or qty_raw == 0.0:
             continue
 
-        product_id, uom_po_id = found
+        product_id = None
+        uom_po_id: Optional[int] = None
 
-        # Rellenar precio si viene vacío
-        if price <= 0:
-            price = _get_purchase_price_for_line(
-                models,
-                e,
-                uid,
-                product_id=product_id,
-                partner_id=partner_id,
-                qty=qty,
-                date_planned=date_planned,
-            )
+        prod = _find_product_by_default_code(models, e, uid, sku)
+        if prod:
+            product_id, uom_po_id = prod
+        else:
+            alt_code = sku.replace(" ", "")
+            prod = _find_product_by_default_code(models, e, uid, alt_code)
+            if prod:
+                product_id, uom_po_id = prod
+            else:
+                # Búsqueda por coincidencia parcial en default_code con agujas derivadas
+                needles: List[str] = [sku]
+                # Añadir tokens numéricos largos (≥5 dígitos) detectados en Producto/Descripción
+                num_tokens: Set[str] = set()
+                for src in (raw_prod, desc):
+                    for m in re.findall(r"\d{5,}", str(src or "")):
+                        num_tokens.add(m)
+                needles.extend(sorted(num_tokens))
+                prod = _find_product_by_default_code_partial(models, e, uid, needles)
+                if prod:
+                    product_id, uom_po_id = prod
 
-        vals = {
+        if not product_id:
+            try:
+                product_id, uom_po_id = _create_product(
+                    models,
+                    e,
+                    uid,
+                    default_code=sku,
+                    name=(desc or sku).strip(),
+                    supplier_id=partner_id,
+                )
+            except Exception as ex:
+                print(f"[ERROR] Creando producto '{sku}': {ex}")
+                missing_codes.add(sku)
+                continue
+
+        # Precio neto según configuración (positivo)
+        net_price = price
+        if (not e["price_is_net"]) and disc > 0:
+            net_price = round(price * (1.0 - disc / 100.0), 6)
+
+        # CAMBIO: líneas de abono => cantidad NEGATIVA y price_unit POSITIVO
+        is_refund_line = qty_raw < 0
+        qty = qty_raw  # ya viene negativa si es abono
+        price_unit = abs(net_price)
+
+        line_vals = {
+            "name": desc or sku,
             "product_id": product_id,
-            "name": desc or code,
-            "date_planned": date_planned,
             "product_qty": qty,
-            "price_unit": price,
-            "discount": disc,
+            "price_unit": price_unit,
+            "date_planned": date_planned,
         }
         if uom_po_id:
-            # Clave: usar unidad de compra para que respete la cantidad
-            vals["product_uom"] = uom_po_id
-        lines.append((0, 0, vals))
+            line_vals["product_uom"] = uom_po_id
+        lines.append((0, 0, line_vals))
 
-    if missing_codes:
-        print(
-            f"[ODOO] Productos no encontrados ({len(missing_codes)}): {', '.join(sorted(missing_codes))}. PO no creado."
-        )
-        return
     if not lines:
-        print("[ODOO] No hay líneas válidas. PO no creado.")
+        print("[SKIPPED] Sin líneas válidas tras procesar CSV.")
         return
 
-    order_vals: Dict[str, Any] = {
+    # Crear la compra
+    po_vals = {
         "partner_id": partner_id,
-        "partner_ref": ref,
-        "company_id": e["company_id"],
+        "partner_ref": ref or "",
+        "date_order": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         "order_line": lines,
     }
     if picking_type_id:
-        order_vals["picking_type_id"] = picking_type_id
+        po_vals["picking_type_id"] = picking_type_id
+    if import_hash:
+        po_vals["x_import_hash"] = import_hash
 
     po_id = models.execute_kw(
-        e["db"], uid, e["password"], "purchase.order", "create", [order_vals]
+        e["db"], uid, e["password"], "purchase.order", "create", [po_vals]
     )
-    print(f"[ODOO] Orden de compra creada ID {po_id} (ref {ref})")
+
+    # Intentar confirmar pedido
+    try:
+        models.execute_kw(
+            e["db"], uid, e["password"], "purchase.order", "button_confirm", [[po_id]]
+        )
+    except Exception:
+        pass
+
+    # Mantener marca informativa de abono si existen campos x_*
+    if is_refund_order:
+        try:
+            models.execute_kw(
+                e["db"],
+                uid,
+                e["password"],
+                "purchase.order",
+                "write",
+                [[po_id], {"x_is_refund": True}],
+            )
+        except Exception:
+            pass
+
+    print(
+        f"[CREATED] purchase.order id={po_id} partner_id={partner_id} ref='{ref}' source='{Path(csv_path).name}'"
+    )
+
+
+if __name__ == "__main__":
+    import_csv(os.getenv("IMPORT_CSV_PATH", "data.csv"))

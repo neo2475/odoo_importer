@@ -14,13 +14,10 @@ _DEF_FMT = (
 )
 
 
-def setup_logging(level: str | None = None) -> None:
-    """Configura Loguru según LOG_LEVEL y LOG_DIR."""
-    level = (level or os.getenv("LOG_LEVEL", "INFO")).upper()
+def setup_logging():
+    level = os.getenv("LOG_LEVEL", "INFO")
     logger.remove()
-    logger.add(
-        sys.stderr, level=level, format=_DEF_FMT, backtrace=False, diagnose=False
-    )
+    logger.add(sys.stderr, level=level, format=_DEF_FMT)
 
     log_dir = Path(os.getenv("LOG_DIR", "logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -36,3 +33,4 @@ def setup_logging(level: str | None = None) -> None:
 
 def get_logger():
     return logger
+
