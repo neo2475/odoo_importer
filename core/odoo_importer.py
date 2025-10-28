@@ -89,6 +89,32 @@ def _parse_disc(val: str, default: float = 0.0) -> float:
         return default
 
 
+def _parse_discounts_chain(val: str) -> float:
+    """
+    Convierte una cadena de descuentos encadenados en un % efectivo.
+    Ej.: "65 15" => 1 - (1-0.65)*(1-0.15) = 70.25
+    Acepta separadores por espacio/coma y el símbolo %.
+    Devuelve el porcentaje efectivo con 6 decimales.
+    """
+    s = str(val or "").strip()
+    if not s:
+        return 0.0
+    # extrae números (enteros o decimales) y normaliza coma decimal
+    tokens = re.findall(r"[-+]?\d+[.,]?\d*", s.replace("%", " "))
+    eff_factor = 1.0
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            d = float(tok.replace(",", "."))
+        except Exception:
+            continue
+        eff_factor *= 1.0 - d / 100.0
+    eff_pct = (1.0 - eff_factor) * 100.0
+    return round(eff_pct, 6)
+
+
 def _extract_code(val: str) -> str:
     if val is None:
         return ""
@@ -561,9 +587,12 @@ def import_csv(csv_path: str) -> None:
         sku = _extract_sku(raw_prod)
         qty_raw = _parse_qty(row["Líneas del pedido/Cantidad"], 0.0)
         price = _parse_price(row["Líneas del pedido/Precio unitario"])
+        # disc simple (por compatibilidad con CSV antiguos)
         disc = _parse_disc(row["Líneas del pedido/(%) Descuento"])
+        # NUEVO: descuento efectivo por cadena (soporta "65 15", "65, 15%", etc.)
+        eff_disc = _parse_discounts_chain(row["Líneas del pedido/(%) Descuento"])
 
-        # CAMBIO: aceptamos negativas; solo descartamos 0 o SKU vacío
+        # aceptamos negativas; solo descartamos 0 o SKU vacío
         if not sku or qty_raw == 0.0:
             continue
 
@@ -606,15 +635,13 @@ def import_csv(csv_path: str) -> None:
                 missing_codes.add(sku)
                 continue
 
-        # Precio neto según configuración (positivo)
-        net_price = price
-        if (not e["price_is_net"]) and disc > 0:
-            net_price = round(price * (1.0 - disc / 100.0), 6)
-
-        # CAMBIO: líneas de abono => cantidad NEGATIVA y price_unit POSITIVO
+        # --- CAMBIO DE LÓGICA DE PRECIOS/DTO ---
+        # Antes: si IMPORT_PRICE_IS_NET==False, neteábamos price con 'disc'.
+        # Ahora: Enviamos precio BRUTO y el % de descuento efectivo en 'discount'.
+        # (Las líneas de abono mantienen cantidad negativa y price_unit positivo).
         is_refund_line = qty_raw < 0
-        qty = qty_raw  # ya viene negativa si es abono
-        price_unit = abs(net_price)
+        qty = qty_raw
+        price_unit = abs(price)  # siempre bruto, positivo
 
         line_vals = {
             "name": desc or sku,
@@ -625,6 +652,14 @@ def import_csv(csv_path: str) -> None:
         }
         if uom_po_id:
             line_vals["product_uom"] = uom_po_id
+
+        # si hay descuento efectivo, lo informamos
+        if eff_disc > 0:
+            line_vals["discount"] = eff_disc
+        elif disc > 0:
+            # fallback por compatibilidad (si no venía encadenado)
+            line_vals["discount"] = disc
+
         lines.append((0, 0, line_vals))
 
     if not lines:
@@ -647,13 +682,14 @@ def import_csv(csv_path: str) -> None:
         e["db"], uid, e["password"], "purchase.order", "create", [po_vals]
     )
 
-    # Intentar confirmar pedido
-    try:
-        models.execute_kw(
-            e["db"], uid, e["password"], "purchase.order", "button_confirm", [[po_id]]
-        )
-    except Exception:
-        pass
+    # (DESACTIVADO) Confirmación automática del pedido.
+    # Dejamos el PO en estado borrador (presupuesto/RFQ) y NO llamamos a button_confirm.
+    # try:
+    #     models.execute_kw(
+    #         e["db"], uid, e["password"], "purchase.order", "button_confirm", [[po_id]]
+    #     )
+    # except Exception:
+    #     pass
 
     # Mantener marca informativa de abono si existen campos x_*
     if is_refund_order:
