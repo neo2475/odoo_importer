@@ -59,6 +59,20 @@ def detect_provider_from_path(pdf_path: str) -> Optional[str]:
     return detect_provider(txt, p.name)
 
 
+
+
+def detect_adapter(txt: str, filename: str) -> Optional[Type[BaseAdapter]]:
+    """Compatibilidad hacia atrás.
+
+    Devuelve la clase de adapter que detecta el documento o None si no hay
+    coincidencia única.
+    """
+    provider_key = detect_provider(txt, filename)
+    if provider_key is None:
+        return None
+    return get_adapter(provider_key)
+
+
 # Importa los módulos concretos para que se auto-registren con @register
 from . import (
     gpautomocion,  # noqa: F401  (key suele ser 'grupo_pena')
@@ -71,5 +85,6 @@ __all__ = [
     "register",
     "get_adapter",
     "detect_provider",
+    "detect_adapter",
     "detect_provider_from_path",
 ]

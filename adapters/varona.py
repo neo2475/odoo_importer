@@ -48,9 +48,43 @@ def agrupar_filas(words, tol: float = 1.0):
 
 
 def ref_albaran(txt: str) -> str:
-    """Extrae la referencia del albarán (VA02xxxxx) a partir del texto."""
-    m = re.search(r"VA02\s+(\d{2}\.\d{3})", txt)
-    return "VA02" + m.group(1).replace(".", "") if m else ""
+    """Extrae el identificador de albarán desde el texto del PDF.
+
+    Históricamente Varona ha usado varios formatos:
+
+    - Formato "antiguo": aparece como 'VA02 12.345' (se devuelve 'VA0212345' para mantener compatibilidad).
+    - Formato "nuevo" (visto en PDFs recientes): en la cabecera aparece
+      'Albarán Nº ...' y en la línea siguiente 'VA02 <NUM_ALBARAN> <FECHA> <CLIENTE>'.
+    - Además, suele repetirse en códigos entre asteriscos (p.ej. '*000000527*' o '*1-2026-VEN-VA02-527*').
+
+    Estrategia:
+    1) Buscar por contexto de cabecera (más robusto ante variaciones de posición).
+    2) Fallback a patrones entre asteriscos.
+    3) Mantener el patrón antiguo como último recurso.
+    """
+
+    # 1) Contexto de cabecera: 'Albarán Nº ...\nVA02 <num> <fecha> <cliente>'
+    m = re.search(
+        r"Albar[aá]n\s*N[ºo]\b[^\n]{0,120}\n[^\n]*?\bVA02\b\s+(?P<num>\d{1,10})\b",
+        txt,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return m.group("num").lstrip("0") or "0"
+
+    # 2.a) Código de barras / impresión: '*000000527*' (solo ceros + dígitos)
+    m = re.search(r"\*0+(?P<num>\d{3,10})\*", txt)
+    if m:
+        return m.group("num").lstrip("0") or "0"
+
+    # 2.b) Identificador largo: '*1-2026-VEN-VA02-527*' => capturar el último tramo numérico
+    m = re.search(r"\*[^*\n]*?\bVA02-(?P<num>\d{1,10})\*", txt)
+    if m:
+        return m.group("num").lstrip("0") or "0"
+
+    # 3) Compatibilidad con el patrón antiguo: 'VA02 12.345' => 'VA0212345'
+    m = re.search(r"\bVA02\b\s+(?P<legacy>\d{1,3}(?:\.\d{3})+)\b", txt)
+    return "VA02" + m.group("legacy").replace(".", "") if m else ""
 
 
 def detectar_almacen(txt: str) -> str:
